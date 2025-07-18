@@ -6,6 +6,7 @@ import logging
 from pathlib import Path
 import pathspec
 from typing import List, Dict, Set, Optional
+import io
 
 # --- Constants ---
 
@@ -112,27 +113,27 @@ def _generate_tree_structure(paths: List[Path], root_name: str) -> str:
 
 def bundle_project(
     project_dir: str,
-    output_file: str,
     extra_ignore_patterns: Optional[List[str]] = None,
     use_gitignore: bool = True,
     custom_ignore_file: Optional[str] = None,
-) -> None:
+) -> str:
     """
-    Scans a directory and bundles all non-ignored, non-binary files into a single text file.
+    Scans a directory and bundles all non-ignored, non-binary files into a single string.
 
     Args:
         project_dir: The root directory of the project to bundle.
-        output_file: The path to the output text file.
         extra_ignore_patterns: A list of additional gitignore-style patterns to exclude files.
         use_gitignore: If True, respects the .gitignore file in the project directory.
         custom_ignore_file: Path to a custom file containing ignore patterns.
+
+    Returns:
+        A string containing the bundled project content.
 
     Raises:
         FileNotFoundError: If the project_dir does not exist or is not a directory.
     """
     try:
         root_path = Path(project_dir).resolve()
-        output_path = Path(output_file).resolve()
     except Exception as e:
         raise ValueError(f"Invalid path provided: {e}") from e
 
@@ -156,10 +157,6 @@ def bundle_project(
 
         for filename in filenames:
             file_path = current_dir_path / filename
-            
-            if file_path == output_path:
-                continue
-
             relative_path = file_path.relative_to(root_path)
             
             if spec.match_file(str(relative_path)):
@@ -172,32 +169,32 @@ def bundle_project(
             included_paths.append(relative_path)
     
     logger.info(f"Found {len(included_paths)} files to include.")
-    logger.info(f"Generating output file at '{output_path}'...")
+    
+    # Use an in-memory text stream for efficient string building
+    output_stream = io.StringIO()
 
-    with open(output_path, "w", encoding="utf-8") as outfile:
-        tree_structure = _generate_tree_structure(included_paths, root_path.name)
-        outfile.write("<layout>\n")
-        outfile.write(tree_structure)
-        outfile.write("\n</layout>\n\n")
+    tree_structure = _generate_tree_structure(included_paths, root_path.name)
+    output_stream.write("<layout>\n")
+    output_stream.write(tree_structure)
+    output_stream.write("\n</layout>\n\n")
 
-        for relative_path in sorted(included_paths):
-            try:
-                full_path = root_path / relative_path
-                with open(full_path, "r", encoding="utf-8", errors="ignore") as infile:
-                    content = infile.read()
-                
-                path_str = str(relative_path).replace("\\", "/")
-                
-                outfile.write(f'<file path="{path_str}">\n')
-                outfile.write(content)
-                outfile.write("\n</file>\n\n")
-                logger.debug(f"  + Add: {relative_path}")
+    for relative_path in sorted(included_paths):
+        try:
+            full_path = root_path / relative_path
+            with open(full_path, "r", encoding="utf-8", errors="ignore") as infile:
+                content = infile.read()
             
-            except Exception as e:
-                logger.warning(f"  - Error reading {relative_path}: {e}")
-
-    logger.info("Processing complete.")
-    logger.info(f"Bundled {len(included_paths)} files into '{output_path}'.")
+            path_str = str(relative_path).replace("\\", "/")
+            
+            output_stream.write(f'<file path="{path_str}">\n')
+            output_stream.write(content)
+            output_stream.write("\n</file>\n\n")
+            logger.debug(f"  + Add: {relative_path}")
+        
+        except Exception as e:
+            logger.warning(f"  - Error reading {relative_path}: {e}")
+    
+    return output_stream.getvalue()
 
 # --- Command-Line Interface ---
 
@@ -226,52 +223,47 @@ def cli_main():
         formatter_class=argparse.RawTextHelpFormatter
     )
     
-    parser.add_argument(
-        "directory", 
-        help="The root directory of the project to bundle."
-    )
-    parser.add_argument(
-        "-o", "--output", 
-        default="combined_output.txt",
-        help="The name of the output file. (default: combined_output.txt)"
-    )
-    parser.add_argument(
-        "-e", "--exclude",
-        nargs='*',
-        default=[],
-        metavar="PATTERN",
-        help="Additional glob patterns to exclude files/directories. Can be specified multiple times."
-    )
-    parser.add_argument(
-        "--no-gitignore",
-        action="store_true",
-        help="Do not use the .gitignore file for exclusion rules."
-    )
-    parser.add_argument(
-        "--ignore-file",
-        metavar="FILEPATH",
-        help="Path to a custom file with ignore patterns (e.g., .dockerignore)."
-    )
-    parser.add_argument(
-        "-v", "--verbose",
-        action="store_true",
-        help="Enable verbose output for debugging purposes."
-    )
+    parser.add_argument("directory", help="The root directory of the project to bundle.")
+    parser.add_argument("-o", "--output", default="combined_output.txt", help="The name of the output file. (default: combined_output.txt)")
+    parser.add_argument("-e", "--exclude", nargs='*', default=[], metavar="PATTERN", help="Additional glob patterns to exclude files/directories. Can be specified multiple times.")
+    parser.add_argument("--no-gitignore", action="store_true", help="Do not use the .gitignore file for exclusion rules.")
+    parser.add_argument("--ignore-file", metavar="FILEPATH", help="Path to a custom file with ignore patterns (e.g., .dockerignore).")
+    parser.add_argument("-v", "--verbose", action="store_true", help="Enable verbose output for debugging purposes.")
     
     args = parser.parse_args()
     
-    # Configure logging
     log_level = logging.DEBUG if args.verbose else logging.INFO
     logging.basicConfig(level=log_level, format='%(levelname)s: %(message)s')
 
     try:
-        bundle_project(
+        root_path = Path(args.directory).resolve()
+        output_path = Path(args.output).resolve()
+        
+        cli_ignore_patterns = args.exclude[:]
+        
+        # Exclude the output file itself if it's inside the project directory
+        # to prevent it from being included in its own content.
+        try:
+            relative_output_path = output_path.relative_to(root_path)
+            # Use a pattern that matches the file exactly from the root
+            ignore_pattern = f"/{str(relative_output_path).replace(os.sep, '/')}"
+            cli_ignore_patterns.append(ignore_pattern)
+        except ValueError:
+            # Output file is not inside the project directory, so no need to ignore it.
+            pass
+
+        scroll_content = bundle_project(
             project_dir=args.directory,
-            output_file=args.output,
-            extra_ignore_patterns=args.exclude,
+            extra_ignore_patterns=cli_ignore_patterns,
             use_gitignore=not args.no_gitignore,
             custom_ignore_file=args.ignore_file
         )
+
+        with open(output_path, "w", encoding="utf-8") as f:
+            f.write(scroll_content)
+        
+        logger.info(f"Processing complete. Scroll successfully created at '{output_path}'.")
+
     except (FileNotFoundError, ValueError) as e:
         logger.error(e)
         exit(1)
